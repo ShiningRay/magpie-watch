@@ -1,0 +1,295 @@
+#!/usr/bin/env python3
+"""Canary suite: detect a model quietly getting dumber.
+
+Runs a fixed set of questions with exactly-checkable answers against every model
+in a magpie group, appends the results to a JSONL history, and compares today's
+pass rate against the previous week.
+
+Exit codes: 0 = healthy, 3 = regression detected (so a cron job can alert).
+
+Env:
+  MAGPIE_BASE     default http://127.0.0.1:3425
+  CANARY_GROUP    default free-first
+  CANARY_MODELS   comma list; empty = members of CANARY_GROUP
+  CANARY_HISTORY  default ~/.local/state/magpie-canary/history.jsonl
+  CANARY_TIMEOUT  default 90 seconds per question
+  CANARY_QUIET    set to 1 to print only the summary
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import statistics
+import sys
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+BASE = os.environ.get("MAGPIE_BASE", "http://127.0.0.1:3425").rstrip("/")
+GROUP = os.environ.get("CANARY_GROUP", "free-first")
+HISTORY = Path(
+    os.environ.get("CANARY_HISTORY", str(Path.home() / ".local/state/magpie-canary/history.jsonl"))
+)
+TIMEOUT = float(os.environ.get("CANARY_TIMEOUT", "90"))
+QUIET = os.environ.get("CANARY_QUIET") == "1"
+
+# 每题都要有唯一、可机器判定的答案；数字与措辞刻意不取网上最烂大街的版本。
+QUESTIONS = [
+    ("sheep", "17 只羊，除了 9 只全跑了，还剩几只？只输出数字。", "9", "exact"),
+    ("ball", "球拍和球一共 1.10 元，球拍比球贵 1.00 元。球多少钱？只输出数字。", "0.05", "exact"),
+    ("walls", "3 个人 3 小时刷 3 面墙。9 个人 9 小时能刷几面墙？只输出数字。", "27", "exact"),
+    ("text", "只输出这行文字，不要任何其他内容：HELLO-WORLD", "hello-world", "exact"),
+    ("json", '只输出 JSON，不要解释：{"a": 2+3, "b": "ok"}', '{"a":5,"b":"ok"}', "json"),
+    ("count", "strawberry 这个词里有几个字母 r？只输出数字。", "3", "exact"),
+    ("weekday", "如果今天是星期三，5 天后是星期几？只回答“星期X”，不要其他内容。", "星期一", "exact"),
+    ("reverse", "把字符串 abc123 完全倒序输出，只输出结果。", "321cba", "exact"),
+]
+
+
+def judge(kind: str, raw: str, expected: str) -> bool:
+    got = (raw or "").strip()
+    if kind == "json":
+        m = re.search(r"\{.*\}", got, re.S)
+        if not m:
+            return False
+        try:
+            payload = json.loads(m.group(0))
+        except Exception:
+            return False
+        return payload == {"a": 5, "b": "ok"}
+    # exact: 去掉空白、标点与常见装饰后严格比对
+    cleaned = re.sub(r"[\s\"'`,。.:：]", "", got).lower()
+    want = re.sub(r"[\s\"'`,。.:：]", "", expected).lower()
+    return cleaned == want
+
+
+def ask(model: str, prompt: str) -> tuple[str, int | None, int]:
+    body = json.dumps(
+        {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 256,
+            "temperature": 0,
+        }
+    ).encode()
+    req = urllib.request.Request(
+        f"{BASE}/v1/chat/completions",
+        data=body,
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        data = json.load(resp)
+    choice = (data.get("choices") or [{}])[0]
+    content = (choice.get("message") or {}).get("content") or ""
+    usage = data.get("usage") or {}
+    rt = (usage.get("completion_tokens_details") or {}).get("reasoning_tokens")
+    return content, rt, int(usage.get("completion_tokens") or 0)
+
+
+def group_models() -> list[str]:
+    raw = os.environ.get("CANARY_MODELS", "").strip()
+    if raw:
+        return [m.strip() for m in raw.split(",") if m.strip()]
+    import subprocess
+
+    out = subprocess.run(
+        ["magpie", "group", GROUP], capture_output=True, text=True, timeout=60
+    ).stdout
+    models, inside = [], False
+    for line in out.splitlines():
+        if line.startswith("  models"):
+            inside = True
+            m = re.match(r"\s+models\s+\d+\s+(\S+)", line)
+            if m:
+                models.append(m.group(1))
+            continue
+        if inside:
+            m = re.match(r"\s+\d+\s+(\S+)", line)
+            if m:
+                models.append(m.group(1))
+            else:
+                break
+    # 去掉 :max 之类的后缀，直连模型本身
+    return [m.split(":", 1)[0] for m in models]
+
+
+def main() -> int:
+    models = group_models()
+    if not models:
+        print("canary: 没有可测的模型")
+        return 0
+
+    now = int(time.time())
+    day = time.strftime("%Y-%m-%d")
+    rows = []
+    for model in models:
+        passed = 0
+        for qid, prompt, expected, kind in QUESTIONS:
+            started = time.time()
+            try:
+                content, rt, out_tokens = ask(model, prompt)
+                ok = judge(kind, content, expected)
+                err = ""
+            except urllib.error.HTTPError as exc:
+                content, rt, out_tokens, ok = "", None, 0, False
+                err = f"HTTP {exc.code}"
+            except Exception as exc:
+                content, rt, out_tokens, ok = "", None, 0, False
+                err = f"{type(exc).__name__}"
+            elapsed = int((time.time() - started) * 1000)
+            passed += 1 if ok else 0
+            rows.append(
+                {
+                    "ts": now,
+                    "day": day,
+                    "model": model,
+                    "q": qid,
+                    "ok": ok,
+                    "answer": (content or "")[:120],
+                    "reasoning_tokens": rt,
+                    "completion_tokens": out_tokens,
+                    "ms": elapsed,
+                    "error": err,
+                }
+            )
+        if not QUIET:
+            detail = " ".join(
+                f"{r['q']}{'✓' if r['ok'] else '✗'}" for r in rows if r["model"] == model
+            )
+            print(f"{model}: {passed}/{len(QUESTIONS)}  {detail}")
+        rows.append(
+            {
+                "ts": now,
+                "day": day,
+                "model": model,
+                "q": "__score__",
+                "ok": passed == len(QUESTIONS),
+                "passed": passed,
+                "total": len(QUESTIONS),
+            }
+        )
+
+    HISTORY.parent.mkdir(parents=True, exist_ok=True)
+    with HISTORY.open("a") as fh:
+        for row in rows:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    # 基线：最近 7 天（不含今天）每个模型的平均通过率
+    history = []
+    try:
+        for line in HISTORY.read_text().splitlines():
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            if rec.get("q") == "__score__":
+                history.append(rec)
+            elif rec.get("q"):
+                history.append(rec)
+    except FileNotFoundError:
+        pass
+
+    today = {}
+    baseline: dict[str, list[float]] = {}
+    for rec in history:
+        if rec.get("q") == "__score__":
+            rate = (rec.get("passed", 0) / max(1, rec.get("total", 1))) * 100
+        else:
+            continue
+        if rec["day"] == day:
+            today.setdefault(rec["model"], []).append(rate)
+        else:
+            baseline.setdefault(rec["model"], []).append(rate)
+
+    print("\n模型".ljust(44) + "今日   7天基线   判定")
+    bad = []
+    for model in models:
+        cur = statistics.mean(today.get(model, [0]))
+        base = statistics.mean(baseline[model]) if baseline.get(model) else None
+        if base is None:
+            verdict = "首次记录"
+        elif cur < 60:
+            verdict = "⚠️ 明显退化"
+            bad.append(model)
+        elif base and cur < base * 0.8:
+            verdict = f"⚠️ 低于基线（{base:.0f}%）"
+            bad.append(model)
+        else:
+            verdict = "正常"
+        print(f"{model:42} {cur:3.0f}%   " + (f"{base:3.0f}%" if base else "  -  ") + f"    {verdict}")
+
+    # 8 题只有 ±21 个百分点的分辨力，所以对可疑模型做一次复测：
+    # 把失败的题再问一遍，两轮都错才算确认退化，否则判为抖动。
+    confirmed, flaky = [], []
+    for model in bad:
+        failed = [
+            r["q"]
+            for r in rows
+            if r["model"] == model and r.get("q") not in (None, "__score__") and not r["ok"]
+        ]
+        if not failed:
+            confirmed.append(model)
+            continue
+        still = []
+        for qid in failed:
+            q = next((x for x in QUESTIONS if x[0] == qid), None)
+            if not q:
+                still.append(qid)
+                continue
+            started = time.time()
+            try:
+                content, rt, out = ask(model, q[1])
+                ok = judge(q[3], content, q[2])
+            except Exception:
+                content, ok = "", False
+            rows.append(
+                {
+                    "ts": now,
+                    "day": day,
+                    "model": model,
+                    "q": f"{qid}~retry",
+                    "ok": ok,
+                    "answer": (content or "")[:120],
+                    "reasoning_tokens": None,
+                    "completion_tokens": 0,
+                    "ms": int((time.time() - started) * 1000),
+                    "error": "",
+                }
+            )
+            if not ok:
+                still.append(qid)
+        print(f"复测 {model}: 失败 {','.join(failed)} → 仍失败 {','.join(still) or '无'}")
+        cur_rate = statistics.mean(today.get(model, [0]))
+        # 8 题里错 1 题就是 12.5 个百分点，噪音级别；要确认 2 题以上才算退化，
+        # 除非整体已经崩到 60% 以下。
+        if len(still) >= 2 or cur_rate < 60:
+            confirmed.append(model)
+        else:
+            flaky.append(model)
+
+    retry_rows = [r for r in rows if "~retry" in str(r.get("q"))]
+    if retry_rows:
+        with HISTORY.open("a") as fh:
+            for row in retry_rows:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+    if confirmed:
+        print(f"\n确认退化: {', '.join(confirmed)}")
+    elif flaky:
+        print(f"\n⚠️ {', '.join(flaky)} 低于基线但复测通过，判为抖动，不告警")
+
+    # 退出码 0 表示"跑完了"（包括发现退化），2 才是环境故障。
+    # 以前用 3 表示退化，会被 Hermes 当成任务失败，每天误报一次。
+    answered = [r for r in rows if r.get("q") not in (None, "__score__") and not r.get("error")]
+    if not answered:
+        print("\n所有请求都失败了，疑似网关或网络故障")
+        return 2
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

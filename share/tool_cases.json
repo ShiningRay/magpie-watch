@@ -1,0 +1,191 @@
+[
+  {
+    "id": "simple_weather",
+    "category": "simple",
+    "prompt": "北京现在天气怎么样？",
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "查询某个城市的实时天气", "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "城市名"}, "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}}, "required": ["city"]}}},
+      {"type": "function", "function": {"name": "get_forecast", "description": "查询未来 7 天预报", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+    ],
+    "expect": [{"name": "get_weather", "args": {"city": "北京"}}]
+  },
+  {
+    "id": "simple_read",
+    "category": "simple",
+    "prompt": "帮我看下 /etc/hosts 的内容",
+    "tools": [
+      {"type": "function", "function": {"name": "read_file", "description": "读取文本文件内容", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}},
+      {"type": "function", "function": {"name": "list_dir", "description": "列出目录", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+    ],
+    "expect": [{"name": "read_file", "args": {"path": "/etc/hosts"}}]
+  },
+  {
+    "id": "simple_notify",
+    "category": "simple",
+    "prompt": "给 alice@example.com 发封邮件，标题是「周五例会」，正文写「改到下午三点」",
+    "tools": [
+      {"type": "function", "function": {"name": "send_email", "description": "发送邮件", "parameters": {"type": "object", "properties": {"to": {"type": "string"}, "subject": {"type": "string"}, "body": {"type": "string"}}, "required": ["to", "subject", "body"]}}},
+      {"type": "function", "function": {"name": "search_email", "description": "搜索邮件", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+    ],
+    "expect": [{"name": "send_email", "args": {"to": "alice@example.com", "subject": "周五例会"}}]
+  },
+  {
+    "id": "simple_convert",
+    "category": "simple",
+    "prompt": "100 美元换多少人民币？",
+    "tools": [
+      {"type": "function", "function": {"name": "convert_currency", "description": "货币换算", "parameters": {"type": "object", "properties": {"amount": {"type": "number"}, "from": {"type": "string"}, "to": {"type": "string"}}, "required": ["amount", "from", "to"]}}}
+    ],
+    "expect": [{"name": "convert_currency", "args": {"amount": 100, "from": "USD", "to": "CNY"}}]
+  },
+  {
+    "id": "choice_restart",
+    "category": "choice",
+    "prompt": "把 nginx 重启一下",
+    "tools": [
+      {"type": "function", "function": {"name": "service_status", "description": "查看服务运行状态", "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
+      {"type": "function", "function": {"name": "service_restart", "description": "重启服务", "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}},
+      {"type": "function", "function": {"name": "service_stop", "description": "停止服务", "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}}
+    ],
+    "expect": [{"name": "service_restart", "args": {"name": "nginx"}}]
+  },
+  {
+    "id": "choice_search",
+    "category": "choice",
+    "prompt": "在项目文档里搜一下「限流」相关的说明",
+    "tools": [
+      {"type": "function", "function": {"name": "web_search", "description": "搜索公网网页", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}},
+      {"type": "function", "function": {"name": "docs_search", "description": "在内部项目文档中检索", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+    ],
+    "expect": [{"name": "docs_search", "args": {"query": "限流"}}]
+  },
+  {
+    "id": "choice_create_event",
+    "category": "choice",
+    "prompt": "帮我约个周三上午十点的会，主题「架构评审」",
+    "tools": [
+      {"type": "function", "function": {"name": "list_events", "description": "列出日程", "parameters": {"type": "object", "properties": {"date": {"type": "string"}}, "required": ["date"]}}},
+      {"type": "function", "function": {"name": "create_event", "description": "创建日程", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "start": {"type": "string"}, "duration_min": {"type": "integer"}}, "required": ["title", "start"]}}}
+    ],
+    "expect": [{"name": "create_event", "args": {"title": "架构评审"}}]
+  },
+  {
+    "id": "choice_move",
+    "category": "choice",
+    "prompt": "把 /tmp/report.pdf 挪到 ~/docs 下面",
+    "tools": [
+      {"type": "function", "function": {"name": "copy_file", "description": "复制文件", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "dst": {"type": "string"}}, "required": ["src", "dst"]}}},
+      {"type": "function", "function": {"name": "move_file", "description": "移动文件", "parameters": {"type": "object", "properties": {"src": {"type": "string"}, "dst": {"type": "string"}}, "required": ["src", "dst"]}}},
+      {"type": "function", "function": {"name": "delete_file", "description": "删除文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+    ],
+    "expect": [{"name": "move_file", "args": {"src": "/tmp/report.pdf"}}]
+  },
+  {
+    "id": "parallel_weather",
+    "category": "parallel",
+    "prompt": "北京和上海现在的天气分别怎么样？",
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "查询城市实时天气", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+    ],
+    "expect": [{"name": "get_weather", "args": {"city": "北京"}}, {"name": "get_weather", "args": {"city": "上海"}}]
+  },
+  {
+    "id": "parallel_read",
+    "category": "parallel",
+    "prompt": "同时读一下 a.txt 和 b.txt",
+    "tools": [
+      {"type": "function", "function": {"name": "read_file", "description": "读取文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+    ],
+    "expect": [{"name": "read_file", "args": {"path": "a.txt"}}, {"name": "read_file", "args": {"path": "b.txt"}}]
+  },
+  {
+    "id": "parallel_status",
+    "category": "parallel",
+    "prompt": "看下 redis 和 postgres 两个服务的状态",
+    "tools": [
+      {"type": "function", "function": {"name": "service_status", "description": "查看服务状态", "parameters": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}}}
+    ],
+    "expect": [{"name": "service_status", "args": {"name": "redis"}}, {"name": "service_status", "args": {"name": "postgres"}}]
+  },
+  {
+    "id": "parallel_convert",
+    "category": "parallel",
+    "prompt": "分别算一下 100 美元和 100 欧元折合多少人民币",
+    "tools": [
+      {"type": "function", "function": {"name": "convert_currency", "description": "货币换算", "parameters": {"type": "object", "properties": {"amount": {"type": "number"}, "from": {"type": "string"}, "to": {"type": "string"}}, "required": ["amount", "from", "to"]}}}
+    ],
+    "expect": [{"name": "convert_currency", "args": {"amount": 100, "from": "USD", "to": "CNY"}}, {"name": "convert_currency", "args": {"amount": 100, "from": "EUR", "to": "CNY"}}]
+  },
+  {
+    "id": "no_call_404",
+    "category": "no_call",
+    "prompt": "HTTP 404 是什么意思？",
+    "tools": [
+      {"type": "function", "function": {"name": "web_search", "description": "搜索网页", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]}}}
+    ],
+    "expect": []
+  },
+  {
+    "id": "no_call_greeting",
+    "category": "no_call",
+    "prompt": "你好",
+    "tools": [
+      {"type": "function", "function": {"name": "get_weather", "description": "查天气", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+    ],
+    "expect": []
+  },
+  {
+    "id": "no_call_arithmetic",
+    "category": "no_call",
+    "prompt": "17 乘以 23 等于多少？",
+    "tools": [
+      {"type": "function", "function": {"name": "send_email", "description": "发邮件", "parameters": {"type": "object", "properties": {"to": {"type": "string"}}, "required": ["to"]}}}
+    ],
+    "expect": []
+  },
+  {
+    "id": "no_call_identity",
+    "category": "no_call",
+    "prompt": "介绍一下你自己",
+    "tools": [
+      {"type": "function", "function": {"name": "read_file", "description": "读文件", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}}}
+    ],
+    "expect": []
+  },
+  {
+    "id": "precision_enum",
+    "category": "precision",
+    "prompt": "创建一个高优先级的任务：修复登录页 500 错误",
+    "tools": [
+      {"type": "function", "function": {"name": "create_task", "description": "创建任务", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "priority": {"type": "string", "enum": ["low", "normal", "high"]}}, "required": ["title", "priority"]}}}
+    ],
+    "expect": [{"name": "create_task", "args": {"priority": "high"}}]
+  },
+  {
+    "id": "precision_date",
+    "category": "precision",
+    "prompt": "把会议定在 2026-11-12 的 14:30",
+    "tools": [
+      {"type": "function", "function": {"name": "create_event", "description": "创建日程", "parameters": {"type": "object", "properties": {"title": {"type": "string"}, "start": {"type": "string", "description": "ISO 8601 时间"}}, "required": ["title", "start"]}}}
+    ],
+    "expect": [{"name": "create_event", "args": {"start": "2026-11-12T14:30"}}]
+  },
+  {
+    "id": "precision_numeric",
+    "category": "precision",
+    "prompt": "把空调温度调到 26 度",
+    "tools": [
+      {"type": "function", "function": {"name": "set_ac", "description": "设置空调", "parameters": {"type": "object", "properties": {"temperature": {"type": "number", "description": "摄氏度数值"}, "mode": {"type": "string", "enum": ["cool", "heat", "fan"]}}, "required": ["temperature"]}}}
+    ],
+    "expect": [{"name": "set_ac", "args": {"temperature": 26}}]
+  },
+  {
+    "id": "precision_nested",
+    "category": "precision",
+    "prompt": "给张三下单，地址是杭州市西湖区文三路 100 号",
+    "tools": [
+      {"type": "function", "function": {"name": "create_order", "description": "创建订单", "parameters": {"type": "object", "properties": {"customer": {"type": "string"}, "address": {"type": "object", "properties": {"city": {"type": "string"}, "street": {"type": "string"}}, "required": ["city", "street"]}}, "required": ["customer", "address"]}}}
+    ],
+    "expect": [{"name": "create_order", "args": {"customer": "张三", "address": {"city": "杭州市"}}}]
+  }
+]

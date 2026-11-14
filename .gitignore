@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+HumanEval.jsonl
+HumanEval.jsonl.gz
+free_extra.txt

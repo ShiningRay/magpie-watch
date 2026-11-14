@@ -1,0 +1,11 @@
+[Unit]
+Description=每小时检查一次思考 token 降智
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=1h
+AccuracySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

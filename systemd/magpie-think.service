@@ -1,0 +1,8 @@
+[Unit]
+Description=检查各 free 模型的思考 token 是否相对自身基线下降
+After=magpie.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/magpie-think --notify
+TimeoutStartSec=300

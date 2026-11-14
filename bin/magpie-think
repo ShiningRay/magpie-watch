@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""按模型比较"思考 token"的近期水平与自身基线，发现悄悄降智。
+
+    magpie-think              # 表格
+    magpie-think --notify     # 有异常时发飞书（每小时定时任务用）
+    magpie-think --json       # 机器可读
+
+判据（每个模型和自己比，不跨模型比较）：
+  baseline = 24 小时以前、7 天以内的 reasoning_tokens 中位数
+  recent   = 最近 24 小时的中位数
+  ratio    = recent / baseline
+  ratio < THINK_WARN(0.5)  → 警告；< THINK_CRIT(0.25) → 严重
+  另有一类硬信号：基线里 80% 的请求都有思考 token，最近的请求却有 80% 是 0
+  → 判为"思考归零"。
+
+基线中位数低于 THINK_MIN_BASE(15) 的模型不参与判定——它本来就不怎么思考
+（比如 iceman 基线只有 6），再掉一半也只是噪声。
+
+顺带把结果推给 netdata（family: magpie-think），并维护一条告警。
+"""
+
+from __future__ import annotations
+
+import csv
+import io
+import json
+import os
+import re
+import socket
+import statistics
+import subprocess
+import sys
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+STATE = Path(os.path.expanduser("~/.local/state/magpie-think/alerted.json"))
+WARN = float(os.environ.get("THINK_WARN", "0.5"))
+CRIT = float(os.environ.get("THINK_CRIT", "0.25"))
+MIN_BASE = float(os.environ.get("THINK_MIN_BASE", "15"))
+MIN_BASE_N = int(os.environ.get("THINK_MIN_BASE_N", "30"))
+MIN_RECENT_N = int(os.environ.get("THINK_MIN_RECENT_N", "10"))
+RECENT_HOURS = float(os.environ.get("THINK_RECENT_HOURS", "24"))
+STATSD = (os.environ.get("STATSD_HOST", "127.0.0.1"), int(os.environ.get("STATSD_PORT", "8125")))
+COOLDOWN_H = float(os.environ.get("THINK_COOLDOWN_H", "24"))
+
+
+def sanitize(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9]+", "_", str(name)).strip("_")
+
+
+def usage_rows() -> list[dict]:
+    out = subprocess.run(
+        ["magpie", "usage", "--csv", "--days", "7"],
+        capture_output=True, text=True, timeout=120,
+    ).stdout
+    return [r for r in csv.DictReader(io.StringIO(out)) if r.get("time")]
+
+
+def num(value, default: float = 0.0) -> float:
+    try:
+        return float(str(value).strip())
+    except Exception:
+        return default
+
+
+def analyse() -> list[dict]:
+    rows = usage_rows()
+    now = datetime.now(timezone.utc)
+    recent_cut = now - timedelta(hours=RECENT_HOURS)
+
+    by_model: dict[str, dict[str, list[float]]] = {}
+    for r in rows:
+        # 用 served_model（真正回答的模型），不是 requested_model：
+        # 62% 的流量请求的是组名，用 requested_model 会把整组混成一个"模型"，
+        # 而且单个模型的样本会被严重低估。served_model 永远是具体模型。
+        mid = (r.get("served_model") or "").strip()
+        if not mid or "free" not in mid.lower():
+            continue
+        try:
+            ts = datetime.fromisoformat(r["time"])
+        except Exception:
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        bucket = "recent" if ts >= recent_cut else "base"
+        by_model.setdefault(mid, {"recent": [], "base": []})[bucket].append(num(r.get("reasoning_tokens")))
+
+    results = []
+    for model, data in by_model.items():
+        base, recent = data["base"], data["recent"]
+        if len(base) < MIN_BASE_N or len(recent) < MIN_RECENT_N:
+            results.append({"model": model, "state": "样本不足", "base_n": len(base), "recent_n": len(recent)})
+            continue
+        base_med = statistics.median(base)
+        recent_med = statistics.median(recent)
+        base_pos = sum(1 for x in base if x > 0) / len(base)
+        recent_zero = sum(1 for x in recent if x == 0) / len(recent)
+        ratio = (recent_med / base_med) if base_med else 0.0
+
+        if base_med < MIN_BASE:
+            state = f"基线过低({base_med:.0f})"
+        elif base_pos >= 0.8 and recent_zero >= 0.8:
+            state = "思考归零"
+        elif ratio <= CRIT:
+            state = "严重下降"
+        elif ratio <= WARN:
+            state = "下降"
+        else:
+            state = "正常"
+        results.append({
+            "model": model, "state": state, "base_med": base_med, "recent_med": recent_med,
+            "ratio": round(ratio, 3), "base_n": len(base), "recent_n": len(recent),
+            "base_pos": round(base_pos, 3), "recent_zero": round(recent_zero, 3),
+        })
+    results.sort(key=lambda r: (r["state"] == "正常", r.get("ratio", 9)))
+    return results
+
+
+CACHE = Path(os.path.expanduser("~/.local/state/magpie-think/latest.json"))
+
+
+def save_cache(results: list[dict]) -> None:
+    """常驻采集器每 2 秒转发这份结果，图表才不会因为一小时才推一次而变旧。"""
+    degraded = sum(1 for r in results if r["state"] in ("下降", "严重下降", "思考归零"))
+    payload = {"degraded": degraded, "ts": time.strftime("%FT%T%z"), "models": {
+        r["model"]: {"ratio": r.get("ratio"), "base": r.get("base_med"), "recent": r.get("recent_med")}
+        for r in results if "ratio" in r}}
+    CACHE.parent.mkdir(parents=True, exist_ok=True)
+    CACHE.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+
+def push_metrics(results: list[dict]) -> None:
+    lines = []
+    degraded = 0
+    for r in results:
+        if r["state"] in ("下降", "严重下降", "思考归零"):
+            degraded += 1
+        if "ratio" not in r:
+            continue
+        key = sanitize(r["model"])
+        lines += [
+            f"think.ratio.{key}:{r['ratio']}|g|#family:magpie-think",
+            f"think.baseline.{key}:{r['base_med']}|g|#family:magpie-think",
+            f"think.recent.{key}:{r['recent_med']}|g|#family:magpie-think",
+        ]
+    lines.append(f"think.degraded:{degraded}|g|#family:magpie-think")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for chunk in lines:
+            sock.sendto((chunk + "\n").encode(), STATSD)
+    finally:
+        sock.close()
+
+
+def load_alerted() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_alerted(data: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    STATE.write_text(json.dumps(data, indent=2, sort_keys=True))
+
+
+def notify(results: list[dict]) -> int:
+    bad = [r for r in results if r["state"] in ("下降", "严重下降", "思考归零")]
+    if not bad:
+        return 0
+    alerted = load_alerted()
+    now = time.time()
+    fresh = [r for r in bad if now - alerted.get(r["model"], 0) > COOLDOWN_H * 3600]
+    if not fresh:
+        return 0
+    lines = ["**magpie 思考 token 异常**"]
+    for r in fresh:
+        detail = (f"{r['base_med']:.0f} → {r['recent_med']:.0f}（{r['ratio']:.0%}，"
+                  f"样本 {r['recent_n']}）")
+        lines.append(f"· {r['model']}：{r['state']} {detail}")
+    lines.append("\n判据：近期中位数 / 自身 7 天基线；<50% 警告，<25% 严重")
+    proc = subprocess.run(["hermes", "send", "-t", "feishu", "-f", "-"], input="\n".join(lines),
+                          text=True, capture_output=True)
+    if proc.returncode == 0:
+        for r in fresh:
+            alerted[r["model"]] = now
+        save_alerted(alerted)
+    return proc.returncode
+
+
+def main() -> int:
+    results = analyse()
+    save_cache(results)
+    push_metrics(results)
+    if "--json" in sys.argv:
+        print(json.dumps(results, ensure_ascii=False, indent=2))
+    else:
+        print(f"{'模型':42}{'基线中位':>9}{'近期中位':>9}{'比例':>7}{'样本':>10}  判定")
+        for r in results:
+            if "ratio" in r:
+                print(f"{r['model']:42}{r['base_med']:>9.0f}{r['recent_med']:>9.0f}"
+                      f"{r['ratio']:>7.2f}{r['base_n']:>5}/{r['recent_n']:<5}  {r['state']}")
+            else:
+                print(f"{r['model']:42}{'-':>9}{'-':>9}{'-':>7}{r['base_n']:>5}/{r['recent_n']:<5}  {r['state']}")
+    if "--notify" in sys.argv:
+        return notify(results)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

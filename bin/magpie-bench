@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+"""Benchmark free models on code and tool-use before letting them into free-first.
+
+    magpie-bench pending                 # 列出还没测评 / 需要重测的 free 模型
+    magpie-bench run --model opencode-go/beam-free
+    magpie-bench run --next              # 测一个（systemd 服务用这个）
+    magpie-bench report                  # 分数表 + 排名
+    magpie-bench apply --dry-run         # 按分数决定组成员（不写）
+
+两个套件：
+  code  HumanEval 采样题，生成后**真的执行单测**（bwrap 沙箱，无网络，10s 超时）
+  tool  20 个函数调用用例（简单 / 选型 / 并行 / 不该调 / 参数精度），比对返回的 tool_calls
+
+总分 = 0.5*code + 0.5*tool，另外记录 p50/p95 延迟和上游实际路由到的模型名。
+
+为什么先测再进组：free-first 是按顺序路由的，把没验证过的模型放前面，
+等于让质量未知的模型先接活；而且免费模型常见"只会调工具但参数瞎填"
+或"根本不出 tool_calls"，这类只能靠实测发现。
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import io
+import json
+import os
+import re
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import datetime
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+BASE = os.environ.get("MAGPIE_BASE", "http://127.0.0.1:3425").rstrip("/")
+DATA = Path(os.environ.get("BENCH_DATA", HOME / ".local/share/magpie-bench"))
+STATE = Path(os.environ.get("BENCH_STATE", HOME / ".local/state/magpie-bench/scores.json"))
+CODE_N = int(os.environ.get("BENCH_CODE_N", "20"))
+TOOL_N = int(os.environ.get("BENCH_TOOL_N", "20"))
+TIMEOUT = float(os.environ.get("BENCH_TIMEOUT", "120"))
+PAUSE = float(os.environ.get("BENCH_PAUSE", "0.5"))
+MIN_SCORE = float(os.environ.get("BENCH_MIN_SCORE", "0.45"))
+FALLBACK = os.environ.get("FALLBACK", "opencode-go/deepseek-v4.1-flash")
+
+# 综合分：能力(bench) + 可用性(最近成功率和延迟)。可切回 ENCH_SORT=bench 只看分数。
+SORT_MODE = os.environ.get("BENCH_SORT", "composite")
+MIN_SAMPLES = int(os.environ.get("BENCH_MIN_SAMPLES", "20"))       # 少于这么多请求，可用性按中性值算
+NEUTRAL_OK = float(os.environ.get("BENCH_NEUTRAL_OK", "0.95"))
+W_QUALITY = float(os.environ.get("BENCH_W_QUALITY", "0.6"))
+LAT_FREE = float(os.environ.get("BENCH_LAT_FREE", "3"))            # 3 秒内不罚
+LAT_PENALTY = float(os.environ.get("BENCH_LAT_PENALTY", "0.02"))   # 每多 1 秒扣 0.02
+STALE_DAYS = float(os.environ.get("BENCH_STALE_DAYS", "7"))        # 超过这么久就重测
+
+STOPS = ["\nclass ", "\nif __name__", "\nprint(", "\n#", '\n"""', "\n@", "\n\ndef "]
+
+
+# ---------------------------------------------------------------- state
+
+
+def is_stale(rec: dict) -> bool:
+    ts = rec.get("bench_ts")
+    if not ts:
+        return True
+    try:
+        when = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S%z")
+    except Exception:
+        return True
+    return (datetime.now(when.tzinfo) - when).days >= STALE_DAYS
+
+
+def model_health(days: int = 1) -> dict[str, dict]:
+    """最近 N 天每个模型的真实成功率与 p50（来自网关自己的请求日志）。"""
+    try:
+        out = subprocess.run(
+            ["magpie", "usage", "--csv", "--days", str(days)],
+            capture_output=True, text=True, timeout=90,
+        ).stdout
+    except Exception:
+        return {}
+    stats: dict[str, dict] = {}
+    for row in csv.DictReader(io.StringIO(out)):
+        mid = row.get("requested_model") or row.get("model") or ""
+        if "free" not in mid.lower():
+            continue
+        st = stats.setdefault(mid, {"requests": 0, "ok": 0, "lat": []})
+        st["requests"] += 1
+        if row.get("status") == "200":
+            st["ok"] += 1
+            try:
+                st["lat"].append(float(row["duration_ms"]))
+            except Exception:
+                pass
+    for st in stats.values():
+        st["ok_rate"] = st["ok"] / st["requests"] if st["requests"] else NEUTRAL_OK
+        st["p50_s"] = (statistics.median(st["lat"]) / 1000) if st["lat"] else 0.0
+        st["lat"].clear()
+    return stats
+
+
+def composite(model: str, rec: dict, health: dict[str, dict]) -> tuple[float, dict]:
+    """能力 0.6 + 可用性 0.4 - 延迟惩罚；样本不足时可用性取中性值。"""
+    bench = float(rec.get("score", 0))
+    h = health.get(model) or {}
+    enough = h.get("requests", 0) >= MIN_SAMPLES
+    ok_rate = h.get("ok_rate", NEUTRAL_OK) if enough else NEUTRAL_OK
+    p50 = h.get("p50_s", 0.0) or 0.0
+    penalty = LAT_PENALTY * max(0.0, p50 - LAT_FREE)
+    value = W_QUALITY * bench + (1 - W_QUALITY) * ok_rate - penalty
+    return round(value, 4), {
+        "ok_rate": round(ok_rate, 4),
+        "samples": h.get("requests", 0),
+        "reliable": enough,
+        "p50_s": round(p50, 2),
+        "penalty": round(penalty, 4),
+    }
+
+
+def write_cache(entries: dict[str, dict]) -> None:
+    """把综合分落成小缓存，供 netdata 采集器读取（避免每次重复算）。"""
+    try:
+        path = STATE.parent / "composite.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(entries, ensure_ascii=False, indent=2, sort_keys=True))
+    except Exception:
+        pass
+
+
+def is_full(rec: dict) -> bool:
+    if os.environ.get("BENCH_ALLOW_PARTIAL") == "1":
+        return bool(rec)
+    w = rec.get("window") or {}
+    return w.get("code_n", 0) >= CODE_N and w.get("tool_n", 0) >= TOOL_N
+
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state: dict) -> None:
+    STATE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True))
+    tmp.replace(STATE)
+
+
+# ---------------------------------------------------------------- gateway
+
+
+def chat(model: str, messages: list, tools: list | None = None, max_tokens: int = 512) -> tuple[dict, float]:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": max_tokens,
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    body = json.dumps(payload).encode()
+    last = ""
+    for attempt in range(3):
+        req = urllib.request.Request(
+            f"{BASE}/v1/chat/completions",
+            data=body,
+            headers={"Content-Type": "application/json"},
+        )
+        started = time.time()
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+                return json.loads(resp.read()), time.time() - started
+        except urllib.error.HTTPError as exc:
+            last = f"HTTP {exc.code}"
+            if exc.code in (429, 500, 502, 503, 504) and attempt < 2:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise RuntimeError(last) from exc
+        except Exception as exc:
+            last = str(exc)[:120]
+            if attempt < 2:
+                time.sleep(3 * (attempt + 1))
+                continue
+            raise RuntimeError(last) from exc
+    raise RuntimeError(last)
+
+
+# ---------------------------------------------------------------- code suite
+
+
+def load_humaneval(n: int) -> list[dict]:
+    path = DATA / "HumanEval.jsonl"
+    rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    rows.sort(key=lambda r: r["task_id"])
+    if n >= len(rows):
+        return rows
+    step = len(rows) / n
+    return [rows[int(i * step)] for i in range(n)]
+
+
+def strip_fences(text: str) -> str:
+    text = text.replace("\r\n", "\n")
+    m = re.search(r"```(?:python|py)?\n(.*?)```", text, re.S)
+    return m.group(1) if m else text
+
+
+def trim_tail(text: str) -> str:
+    # 只在不可能是函数体内容的位置截断；不要碰 """ 或 class（会把 docstring 切坏）
+    for stop in ("\nif __name__", "\nif __main__", "\nprint("):
+        idx = text.find(stop)
+        if idx != -1:
+            text = text[:idx]
+    return text
+
+
+def build_programs(prob: dict, text: str) -> list[str]:
+    text = strip_fences(text)
+    out = []
+    # 情况一：模型把整个函数重写了一遍 —— 直接用它，别和 prompt 拼（会重复定义）
+    if re.search(rf"(?m)^\s*def {re.escape(prob['entry_point'])}\s*\(", text):
+        out.append(text)
+    # 情况二：正常续写 —— prompt 已在最后一行给出签名，直接接上
+    out.append(prob["prompt"] + trim_tail(text))
+    return out
+
+
+def run_code(program: str, timeout: int = 10) -> tuple[bool, str]:
+    with tempfile.TemporaryDirectory(prefix="bench-") as tmp:
+        script = Path(tmp) / "main.py"
+        script.write_text(program)
+        cmd = ["/usr/bin/python3", "main.py"]
+        if shutil.which("bwrap"):
+            mounts = [arg for path in ("/usr", "/lib", "/lib64", "/bin", "/etc/alternatives")
+                      for arg in (["--ro-bind", path, path] if Path(path).exists() else [])]
+            cmd = ["bwrap", *mounts, "--dev", "/dev", "--proc", "/proc", "--tmpfs", "/tmp",
+                   "--unshare-net", "--die-with-parent", "--chdir", tmp,
+                   "--bind", tmp, tmp, *cmd]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, cwd=tmp)
+        except subprocess.TimeoutExpired:
+            return False, "timeout"
+        if proc.returncode == 0:
+            return True, ""
+        return False, (proc.stderr or proc.stdout).strip().splitlines()[-1][:160] if (proc.stderr or proc.stdout).strip() else f"exit {proc.returncode}"
+
+
+def code_suite(model: str, n: int) -> dict:
+    problems = load_humaneval(n)
+    passed, details, latencies, errors = 0, [], [], 0
+    for i, prob in enumerate(problems, 1):
+        try:
+            resp, secs = chat(
+                model,
+                [
+                    {"role": "system", "content": "You are a coding assistant. Complete the Python function. Output code only, never call tools."},
+                    {"role": "user", "content": prob["prompt"]},
+                ],
+                max_tokens=768,
+            )
+            latencies.append(secs * 1000)
+            text = resp["choices"][0]["message"].get("content") or ""
+        except Exception as exc:
+            errors += 1
+            details.append({"task": prob["task_id"], "ok": False, "reason": f"request: {exc}"})
+            print(f"  [{i}/{len(problems)}] {prob['task_id']} 请求失败: {exc}", file=sys.stderr)
+            continue
+        ok, reason = False, "no candidate"
+        for body in build_programs(prob, text):
+            program = body + "\n\n" + prob["test"] + f"\n\ncheck({prob['entry_point']})\n"
+            ok, reason = run_code(program)
+            if ok:
+                break
+        passed += ok
+        details.append({"task": prob["task_id"], "ok": bool(ok), "reason": reason})
+        print(f"  [{i}/{len(problems)}] {prob['task_id']} {'PASS' if ok else 'FAIL ' + reason[:60]}", file=sys.stderr)
+        time.sleep(PAUSE)
+    return {
+        "pass": passed,
+        "total": len(problems),
+        "score": round(passed / len(problems), 4) if problems else 0.0,
+        "errors": errors,
+        "latencies": latencies,
+        "details": details,
+    }
+
+
+# ---------------------------------------------------------------- tool suite
+
+
+def norm(value):
+    if isinstance(value, bool) or value is None:
+        return value
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        try:
+            return float(s)
+        except ValueError:
+            return s
+    if isinstance(value, dict):
+        return {k: norm(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [norm(v) for v in value]
+    return value
+
+
+def args_match(expected: dict, actual: dict) -> bool:
+    for key, want in expected.items():
+        if key not in actual:
+            return False
+        got = actual[key]
+        if isinstance(want, dict):
+            if not isinstance(got, dict) or not args_match(want, got):
+                return False
+        elif isinstance(want, float) and isinstance(norm(got), float):
+            if abs(float(got) - want) > 1e-6:
+                return False
+        elif isinstance(want, str) and isinstance(got, str):
+            if want.strip().lower() not in got.strip().lower():
+                return False
+        elif norm(want) != norm(got):
+            return False
+    return True
+
+
+def cases_match(expected: list[dict], actual: list[dict]) -> bool:
+    if len(expected) != len(actual):
+        return False
+    remaining = list(actual)
+    for exp in expected:
+        hit = None
+        for idx, act in enumerate(remaining):
+            if act.get("name") == exp["name"] and args_match(exp.get("args", {}), act.get("args") or {}):
+                hit = idx
+                break
+        if hit is None:
+            return False
+        remaining.pop(hit)
+    return True
+
+
+def tool_suite(model: str, n: int) -> dict:
+    cases = json.loads((DATA / "tool_cases.json").read_text())[:n]
+    passed, details, latencies, errors = 0, [], [], 0
+    for i, case in enumerate(cases, 1):
+        try:
+            resp, secs = chat(
+                model,
+                [{"role": "user", "content": case["prompt"]}],
+                tools=case["tools"],
+                max_tokens=512,
+            )
+            latencies.append(secs * 1000)
+            msg = resp["choices"][0]["message"]
+        except Exception as exc:
+            errors += 1
+            details.append({"case": case["id"], "ok": False, "reason": f"request: {exc}"})
+            print(f"  [{i}/{len(cases)}] {case['id']} 请求失败: {exc}", file=sys.stderr)
+            continue
+
+        calls = []
+        for call in msg.get("tool_calls") or []:
+            fn = call.get("function") or {}
+            raw = fn.get("arguments") or "{}"
+            try:
+                parsed = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                parsed = {}
+            calls.append({"name": fn.get("name"), "args": parsed})
+
+        if case["expect"]:
+            ok = cases_match(case["expect"], calls)
+            reason = "" if ok else f"得到 {[c['name'] for c in calls] or '无调用'}"
+        else:
+            ok = not calls and bool((msg.get("content") or "").strip())
+            reason = "" if ok else ("多余调用" if calls else "无回复内容")
+
+        passed += ok
+        details.append({"case": case["id"], "ok": bool(ok), "reason": reason})
+        print(f"  [{i}/{len(cases)}] {case['id']} {'PASS' if ok else 'FAIL ' + reason}", file=sys.stderr)
+        time.sleep(PAUSE)
+    return {
+        "pass": passed,
+        "total": len(cases),
+        "score": round(passed / len(cases), 4) if cases else 0.0,
+        "errors": errors,
+        "latencies": latencies,
+        "details": details,
+    }
+
+
+# ---------------------------------------------------------------- commands
+
+
+def free_extra() -> list[str]:
+    """其他 provider 里用户确认为免费的模型（名字里通常没有 free 字样）。
+    写在这里的才会被当成候选，避免把付费模型卷进来自动跑测评。"""
+    path = DATA / "free_extra.txt"
+    try:
+        return [line.strip() for line in path.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+    except FileNotFoundError:
+        return []
+
+
+def available_models() -> list[str]:
+    with urllib.request.urlopen(f"{BASE}/v1/models", timeout=30) as resp:
+        data = json.loads(resp.read())
+    provider = os.environ.get("PROVIDER", "opencode-go")
+    deny = [d for d in os.environ.get("FREE_DENY", "iceman-contributor-free").split() if d]
+    extra = set(free_extra())
+    out = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        if mid in extra:
+            if not any(d in mid for d in deny):
+                out.append(mid)
+            continue
+        if not mid.startswith(provider + "/") or "free" not in mid.lower():
+            continue
+        if any(d in mid for d in deny):
+            continue
+        out.append(mid)
+    return out
+
+
+def run_one(model: str, code_n: int, tool_n: int, state: dict) -> dict:
+    print(f"== 测评 {model}（code {code_n} 题 + tool {tool_n} 题）", file=sys.stderr)
+    started = time.time()
+    code = code_suite(model, code_n)
+    tool = tool_suite(model, tool_n)
+    lat = sorted(code["latencies"] + tool["latencies"])
+    p50 = statistics.median(lat) if lat else 0
+    p95 = lat[int(len(lat) * 0.95) - 1] if lat else 0
+    failures_total = code["errors"] + tool["errors"]
+    total_req = code["total"] + tool["total"]
+    status = "benched" if failures_total * 2 <= total_req else "error"
+    record = {
+        "status": status,
+        "attempts": int((state.get(model) or {}).get("attempts", 0)) + 1,
+        "score": round(0.5 * code["score"] + 0.5 * tool["score"], 4),
+        "code": {k: code[k] for k in ("pass", "total", "score", "errors")},
+        "tool": {k: tool[k] for k in ("pass", "total", "score", "errors")},
+        "latency_ms": {"p50": round(p50), "p95": round(p95)},
+        "failures": [d for d in code["details"] + tool["details"] if not d["ok"]][:12],
+        "window": {"code_n": code_n, "tool_n": tool_n},
+        "bench_ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "duration_s": round(time.time() - started),
+    }
+    state[model] = record
+    save_state(state)
+    print(f"== 完成 {model}: 总分 {record['score']:.2f} "
+          f"(code {code['pass']}/{code['total']}, tool {tool['pass']}/{tool['total']})", file=sys.stderr)
+    return record
+
+
+def cmd_pending(state: dict) -> int:
+    models = available_models()
+    pending = [m for m in models
+               if not (state.get(m, {}).get("status") == "benched"
+                       and is_full(state[m]) and not is_stale(state[m]))]
+    for m in pending:
+        print(m)
+    print(f"# 共 {len(models)} 个 free 模型，{len(pending)} 个待测评", file=sys.stderr)
+    return 0
+
+
+def cmd_run(args, state: dict) -> int:
+    if args.next:
+        models = available_models()
+        todo = [m for m in models
+                if not (state.get(m, {}).get("status") == "benched"
+                        and is_full(state[m]) and not is_stale(state[m]))]
+        if not todo:
+            print("没有待测评的模型")
+            return 0
+        target = todo[0]
+    elif args.model:
+        target = args.model
+    else:
+        print("需要 --model 或 --next", file=sys.stderr)
+        return 2
+    if target not in free_extra() and "free" not in target.split("/")[-1].lower():
+        print(f"拒绝：{target} 看起来不是 free 模型（要测就加进 {DATA / 'free_extra.txt'}）",
+              file=sys.stderr)
+        return 2
+    run_one(target, args.code_n, args.tool_n, state)
+    return 0
+
+
+def cmd_report(state: dict) -> int:
+    rows = [(m, r) for m, r in state.items() if r.get("status") == "benched" and is_full(r)]
+    if not rows:
+        print("还没有测评结果")
+        return 0
+    health = model_health(1)
+    scored = []
+    for m, r in rows:
+        comp, detail = composite(m, r, health)
+        scored.append((m, r, comp, detail))
+    if SORT_MODE == "composite":
+        scored.sort(key=lambda x: -x[2])
+    else:
+        scored.sort(key=lambda x: -x[1].get("score", 0))
+
+    print(f"{'#':>2}  {'模型':40}{'分':>6}{'综合':>6}{'可用性':>8}{'sample':>7}{'实测p50':>8}{'code':>6}{'tool':>6}")
+    for i, (m, r, comp, d) in enumerate(scored, 1):
+        c, t = r.get("code", {}), r.get("tool", {})
+        avail = f"{d['ok_rate']*100:.1f}%" + ("" if d["reliable"] else "*")
+        print(f"{i:>2}  {m:40}{r.get('score', 0):>6.2f}{comp:>6.3f}{avail:>8}"
+              f"{d['samples']:>7}{d['p50_s']:>7.1f}s"
+              f"{c.get('pass', 0):>3}/{c.get('total', 0):<3}{t.get('pass', 0):>3}/{t.get('total', 0):<3}")
+    print(f"\n排序方式 {SORT_MODE} · 入选线 {MIN_SCORE:.2f} · "
+          f"综合分 = {W_QUALITY:.0%}×测评分 + {1-W_QUALITY:.0%}×可用性 − {LAT_PENALTY}×(p50−{LAT_FREE:g}s)")
+    print(f"* 可用性样本 < {MIN_SAMPLES} 次请求，按中性值 {NEUTRAL_OK:.0%} 计")
+    stale = [m for m, r in rows if is_stale(r)]
+    if stale:
+        print(f"过期（>{STALE_DAYS:g} 天未重测）: {', '.join(stale)}")
+    write_cache({m: {"score": r.get("score", 0), "composite": comp, **d,
+                     "stale": is_stale(r)} for m, r, comp, d in scored})
+    return 0
+
+
+def cmd_filter_pending(state: dict) -> int:
+    """stdin 读模型 id，输出还没完成测评的（供组脚本判断要不要继续排队）。"""
+    for line in sys.stdin:
+        m = line.strip()
+        if not m:
+            continue
+        rec = state.get(m) or {}
+        if not (rec.get("status") == "benched" and is_full(rec) and not is_stale(rec)):
+            print(m)
+    return 0
+
+
+def cmd_select(args, state: dict) -> int:
+    """输出可以进组的模型（已测评且过线，外加仍在组里的未测评老成员）。"""
+    models = available_models()
+    current = [re.sub(r":[a-z]+$", "", m.strip()) for m in (args.current or "").split(",") if m.strip()]
+    order = {m: i for i, m in enumerate(current)}
+    health = model_health(1) if SORT_MODE == "composite" else {}
+    keep, dropped = [], []
+    for m in models:
+        rec = state.get(m) or {}
+        if rec.get("status") == "benched" and is_full(rec):
+            if rec.get("score", 0) >= MIN_SCORE:
+                rank = composite(m, rec, health)[0] if SORT_MODE == "composite" else rec["score"]
+                keep.append((m, rank, 0))
+            else:
+                dropped.append((m, rec["score"], 0))
+        elif m in current:
+            keep.append((m, -1.0, order.get(m, 999)))  # 老成员未测评：保留原顺序，排在已测评之后
+    keep.sort(key=lambda x: (-x[1], x[2], x[0]))
+    for m, s, _ in sorted(dropped, key=lambda x: x[1]):
+        print(f"# 分数不足排除 {m} ({s:.2f} < {MIN_SCORE:.2f})", file=sys.stderr)
+    print(",".join(m for m, _, _ in keep))
+    if SORT_MODE == "composite":
+        write_cache({
+            m: {"score": (state.get(m) or {}).get("score", 0),
+                "composite": composite(m, state.get(m) or {}, health)[0],
+                **composite(m, state.get(m) or {}, health)[1],
+                "stale": is_stale(state.get(m) or {})}
+            for m, _, flag in keep if flag == 0
+        })
+    return 0
+
+
+def ranked(state: dict, models: list[str]) -> list[str]:
+    scored, unscored = [], []
+    for m in models:
+        rec = state.get(m, {})
+        if rec.get("status") == "benched" and is_full(rec) and rec.get("score", 0) >= MIN_SCORE:
+            scored.append((m, rec))
+        else:
+            unscored.append(m)
+    health = model_health(1) if SORT_MODE == "composite" else {}
+    key = (lambda kv: -composite(kv[0], kv[1], health)[0]) if SORT_MODE == "composite" \
+        else (lambda kv: -kv[1].get("score", 0))
+    scored.sort(key=key)
+    return [m for m, _ in scored] + unscored
+
+
+def cmd_apply(args, state: dict) -> int:
+    models = available_models()
+    order = ranked(state, models)
+    members = ",".join(order + [FALLBACK] if FALLBACK not in order else order)
+    print(f"# 组成员: {members}", file=sys.stderr)
+    if args.dry_run:
+        print(members)
+        return 0
+    proc = subprocess.run(["magpie", "group", "set", args.group, f"members={members}"],
+                          capture_output=True, text=True)
+    if proc.returncode != 0:
+        print(f"设置分组失败: {proc.stderr.strip()}", file=sys.stderr)
+        return 1
+    print(members)
+    return 0
+
+
+def cmd_notify(args, state: dict) -> int:
+    rows = [(m, r) for m, r in state.items() if r.get("status") == "benched" and is_full(r)]
+    if not rows:
+        return 0
+    model, rec = max(rows, key=lambda kv: kv[1].get("bench_ts", ""))
+    marker = STATE.parent / "notified.json"
+    try:
+        already = json.loads(marker.read_text()).get(model)
+    except Exception:
+        already = None
+    if not getattr(args, "force", False) and already == rec.get("bench_ts"):
+        return 0  # 这条结果已经通知过，别每 10 分钟重发
+    code, tool = rec["code"], rec["tool"]
+    lat = rec.get("latency_ms", {})
+    ranked_rows = sorted(rows, key=lambda kv: -kv[1].get("score", 0))
+    pos = [m for m, _ in ranked_rows].index(model) + 1
+    verdict = "已入组" if rec.get("score", 0) >= MIN_SCORE else f"未达线 {MIN_SCORE:.2f}，不入组"
+    text = (
+        f"**magpie 新模型测评完成**\n"
+        f"模型：{model}\n"
+        f"总分 **{rec['score']:.2f}**（排名 {pos}/{len(rows)}）\n"
+        f"代码 {code['pass']}/{code['total']} · 工具 {tool['pass']}/{tool['total']}\n"
+        f"延迟 p50 {lat.get('p50', 0)/1000:.1f}s / p95 {lat.get('p95', 0)/1000:.1f}s\n"
+        f"结论：{verdict}"
+    )
+    if args.dry_run:
+        print(text)
+        return 0
+    proc = subprocess.run(["hermes", "send", "-t", "feishu", "--json", "-f", "-"], input=text,
+                          text=True, capture_output=True)
+    log = Path(os.environ.get("BENCH_STATE", HOME / ".local/state/magpie-bench/scores.json")).parent / "notify.log"
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a") as fh:
+        one_line = " ".join(proc.stdout.split())[:200]
+        fh.write(f"{time.strftime('%F %T')} rc={proc.returncode} {one_line}\n")
+    if proc.returncode != 0:
+        print(f"发送失败: {proc.stderr.strip()[:200]}", file=sys.stderr)
+        return 1
+    try:
+        marker.write_text(json.dumps({model: rec.get("bench_ts")}, indent=2))
+    except Exception:
+        pass
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="free 模型入库前的 code / tool 测评")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_run = sub.add_parser("run")
+    p_run.add_argument("--model")
+    p_run.add_argument("--next", action="store_true")
+    p_run.add_argument("--code-n", type=int, default=CODE_N)
+    p_run.add_argument("--tool-n", type=int, default=TOOL_N)
+
+    sub.add_parser("pending")
+    sub.add_parser("report")
+
+    sub.add_parser("filter-pending")
+
+    p_sel = sub.add_parser("select")
+    p_sel.add_argument("--current", default="")
+
+    p_notify = sub.add_parser("notify")
+    p_notify.add_argument("--dry-run", action="store_true")
+    p_notify.add_argument("--force", action="store_true")
+
+    p_apply = sub.add_parser("apply")
+    p_apply.add_argument("--group", default="free-first")
+    p_apply.add_argument("--dry-run", action="store_true")
+
+    args = ap.parse_args()
+    state = load_state()
+    if args.cmd == "run":
+        return cmd_run(args, state)
+    if args.cmd == "pending":
+        return cmd_pending(state)
+    if args.cmd == "report":
+        return cmd_report(state)
+    if args.cmd == "notify":
+        return cmd_notify(args, state)
+    if args.cmd == "filter-pending":
+        return cmd_filter_pending(state)
+    if args.cmd == "select":
+        return cmd_select(args, state)
+    if args.cmd == "apply":
+        return cmd_apply(args, state)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
