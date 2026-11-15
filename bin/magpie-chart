@@ -1,0 +1,379 @@
+#!/usr/bin/env python3
+"""magpie-chart — 把 magpie-watch 的检测历史渲染成单文件 HTML 仪表盘。
+
+数据来源：
+  ~/.local/state/magpie-canary/history.jsonl   每次 canary 的逐题结果
+  ~/.local/state/magpie-bench/scores.json      bench 分数（code/tool）
+  ~/.local/state/magpie-bench/composite.json   综合排序
+  ~/.local/state/magpie-think/latest.json      思考 token 基线对比
+  ~/.local/state/magpie-free-group/probe.json  探针状态
+
+用法: magpie-chart [-o out.html] [--open]
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import statistics
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from datetime import datetime
+from pathlib import Path
+
+STATE = Path.home() / ".local/state"
+CANARY = STATE / "magpie-canary/history.jsonl"
+BENCH = STATE / "magpie-bench/scores.json"
+COMPOSITE = STATE / "magpie-bench/composite.json"
+THINK = STATE / "magpie-think/latest.json"
+PROBE = STATE / "magpie-free-group/probe.json"
+
+OUT = Path.home() / ".local/share/dashboards/magpie.html"
+
+C_BG, C_PANEL, C_LINE = "#0f1115", "#171a21", "#262b36"
+C_TEXT, C_DIM = "#d6dae3", "#7c8697"
+C_OK, C_WARN, C_BAD = "#3fb950", "#d29922", "#f85149"
+C1, C2, C3 = "#58a6ff", "#bc8cff", "#7ee787"
+
+QUESTIONS = {"sheep": "羊群", "ball": "球", "walls": "墙", "text": "文本",
+             "json": "JSON", "count": "计数", "weekday": "星期", "reverse": "倒序"}
+
+
+def load_jsonl(p: Path) -> list[dict]:
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                pass
+    return out
+
+
+def load_json(p: Path, default):
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def esc(s) -> str:
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def short(model: str) -> str:
+    return model.split("/")[-1]
+
+
+def color_for(ratio: float) -> str:
+    return C_OK if ratio >= 0.99 else (C_WARN if ratio >= 0.8 else C_BAD)
+
+
+# ── SVG ──────────────────────────────────────────────────────────────
+def svg_series(series: dict[str, list[tuple[float, float]]], width=1120, height=250,
+               ymax=None, ymin=None, unit="") -> str:
+    series = {k: v for k, v in series.items() if v}
+    if not series:
+        return '<p class="empty">没有数据</p>'
+    pts_all = [p for v in series.values() for p in v]
+    t0, t1 = min(p[0] for p in pts_all), max(p[0] for p in pts_all)
+    v0 = ymin if ymin is not None else min(p[1] for p in pts_all)
+    v1 = ymax if ymax is not None else max(p[1] for p in pts_all)
+    if v1 == v0:
+        v1 = v0 + 1
+    if t1 == t0:
+        t1 = t0 + 3600
+    pl, pr, pt, pb = 52, 150, 16, 30
+
+    def X(t): return pl + (t - t0) / (t1 - t0) * (width - pl - pr)
+    def Y(v): return pt + (1 - (v - v0) / (v1 - v0)) * (height - pt - pb)
+
+    b = []
+    for i in range(5):
+        v = v0 + (v1 - v0) * i / 4
+        b.append(f'<line x1="{pl}" y1="{Y(v):.1f}" x2="{width - pr}" y2="{Y(v):.1f}" stroke="{C_LINE}"/>')
+        b.append(f'<text x="{pl - 7}" y="{Y(v) + 4:.1f}" fill="{C_DIM}" font-size="10" '
+                 f'text-anchor="end">{v:.0f}{unit}</text>')
+    for frac in (0, 0.5, 1):
+        t = t0 + (t1 - t0) * frac
+        b.append(f'<text x="{X(t):.1f}" y="{height - 9}" fill="{C_DIM}" font-size="10" '
+                 f'text-anchor="middle">{datetime.fromtimestamp(t).strftime("%m-%d")}</text>')
+    palette = [C1, C2, C3, C_WARN, "#ff7b72", "#79c0ff", "#d2a8ff", "#56d364"]
+    for i, (name, v) in enumerate(sorted(series.items())):
+        c = palette[i % len(palette)]
+        v = sorted(v)
+        b.append('<polyline points="%s" fill="none" stroke="%s" stroke-width="2" opacity="0.9" '
+                 'stroke-linejoin="round"/>' % (" ".join(f"{X(t):.1f},{Y(val):.1f}" for t, val in v), c))
+        for t, val in v:
+            b.append(f'<circle cx="{X(t):.1f}" cy="{Y(val):.1f}" r="2.6" fill="{c}"/>')
+        ly = pt + 8 + i * 15
+        b.append(f'<rect x="{width - pr + 12}" y="{ly - 8}" width="10" height="3" fill="{c}"/>')
+        b.append(f'<text x="{width - pr + 27}" y="{ly - 3}" fill="{C_TEXT}" font-size="10">'
+                 f'{esc(name[:18])}</text>')
+    return (f'<svg viewBox="0 0 {width} {height}" width="100%" height="{height}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(b)}</svg>')
+
+
+def svg_heat(matrix: list[tuple[str, dict[str, tuple[int, int]]]], width=1120) -> str:
+    """matrix: [(模型, {题目: (通过, 总数)})]，每格一个百分比方块。"""
+    if not matrix:
+        return '<p class="empty">没有数据</p>'
+    cols = [q for q in QUESTIONS if any(q in m[1] for m in matrix)]
+    row_h, label_w, cell_w, cell_h = 30, 210, 96, 22
+    head = []
+    for j, q in enumerate(cols):
+        head.append(f'<text x="{label_w + j * cell_w + cell_w / 2}" y="14" fill="{C_DIM}" '
+                    f'font-size="10" text-anchor="middle">{esc(QUESTIONS[q])}</text>')
+    b = list(head)
+    y = 22
+    for model, stats in matrix:
+        b.append(f'<text x="0" y="{y + 16}" fill="{C_TEXT}" font-size="11">{esc(short(model)[:24])}</text>')
+        for j, q in enumerate(cols):
+            hit, tot = stats.get(q, (0, 0))
+            if tot == 0:
+                b.append(f'<rect x="{label_w + j * cell_w}" y="{y}" width="{cell_w - 6}" height="{cell_h}" '
+                         f'fill="{C_PANEL}" stroke="{C_LINE}" rx="3"/>')
+                continue
+            r = hit / tot
+            b.append(f'<rect x="{label_w + j * cell_w}" y="{y}" width="{cell_w - 6}" height="{cell_h}" '
+                     f'fill="{color_for(r)}" opacity="0.28" stroke="{color_for(r)}" rx="3"/>')
+            b.append(f'<text x="{label_w + j * cell_w + (cell_w - 6) / 2}" y="{y + 15}" fill="{C_TEXT}" '
+                     f'font-size="10" text-anchor="middle">{hit}/{tot}</text>')
+        y += row_h
+    return (f'<svg viewBox="0 0 {width} {y + 6}" width="100%" height="{y + 6}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(b)}</svg>')
+
+
+def svg_grouped_bars(rows: list[tuple[str, list[tuple[str, float, str]]]], width=1120,
+                     vmax=1.0) -> str:
+    """每行一个模型，多条横向条形（score / code / tool / composite）。"""
+    if not rows:
+        return '<p class="empty">没有数据</p>'
+    label_w, row_h = 235, 34
+    bar_max = width - label_w - 120
+    b, y = [], 6
+    for name, bars in rows:
+        b.append(f'<text x="0" y="{y + 14}" fill="{C_TEXT}" font-size="11">{esc(name[:26])}</text>')
+        for i, (label, val, color) in enumerate(bars):
+            yy = y + i * 7
+            w = max(1.5, val / vmax * bar_max)
+            b.append(f'<rect x="{label_w}" y="{yy}" width="{w:.1f}" height="5" rx="2.5" '
+                     f'fill="{color}" opacity="0.85"/>')
+            b.append(f'<text x="{label_w + w + 6:.1f}" y="{yy + 5}" fill="{C_DIM}" font-size="9">'
+                     f'{label} {val:.2f}</text>')
+        y += row_h
+    return (f'<svg viewBox="0 0 {width} {y + 4}" width="100%" height="{y + 4}" '
+            f'xmlns="http://www.w3.org/2000/svg">{"".join(b)}</svg>')
+
+
+# ── 页面 ──────────────────────────────────────────────────────────────
+def build(canary: list[dict], bench: dict, composite: dict, think: dict, probe: dict) -> str:
+    # 逐题明细（去掉 __score__ 汇总行；~retry 归并到原题）
+    q_rows = []
+    for r in canary:
+        q = r.get("q", "")
+        if q == "__score__" or not q:
+            continue
+        q_rows.append({**r, "q": q.split("~")[0], "retry": "~retry" in q})
+
+    days = sorted({r["day"] for r in q_rows})
+    models = sorted({r["model"] for r in q_rows})
+
+    # 每日通过率
+    daily: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    for r in q_rows:
+        d = daily[r["model"]][r["day"]]
+        d[1] += 1
+        if r["ok"]:
+            d[0] += 1
+    day_ts = {}
+    for r in q_rows:
+        day_ts[r["day"]] = min(day_ts.get(r["day"], 9e18), r["ts"])
+    pass_series = {
+        short(m): [(day_ts[d], v[0] / v[1] * 100) for d, v in sorted(daily[m].items()) if v[1]]
+        for m in models
+    }
+
+    # 每日延迟中位（只取成功样本）
+    lat: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    tok: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(list))
+    for r in q_rows:
+        if r.get("ok") and r.get("ms"):
+            lat[r["model"]][r["day"]].append(r["ms"])
+        if r.get("reasoning_tokens") is not None:
+            tok[r["model"]][r["day"]].append(r["reasoning_tokens"])
+    lat_series = {short(m): [(day_ts[d], statistics.median(v)) for d, v in sorted(lat[m].items()) if v]
+                  for m in models}
+    tok_series = {short(m): [(day_ts[d], statistics.median(v)) for d, v in sorted(tok[m].items()) if len(v) >= 2]
+                  for m in models}
+
+    # 题目 × 模型
+    per_q: dict[str, dict[str, list[int]]] = defaultdict(lambda: defaultdict(lambda: [0, 0]))
+    for r in q_rows:
+        s = per_q[r["model"]][r["q"]]
+        s[1] += 1
+        if r["ok"]:
+            s[0] += 1
+    matrix = [(m, {q: tuple(v) for q, v in per_q[m].items()}) for m in models]
+    matrix.sort(key=lambda x: -sum(v[0] for v in x[1].values()) / max(sum(v[1] for v in x[1].values()), 1))
+
+    # bench 条形
+    bench_rows = []
+    for m in sorted(set(bench) | set(composite)):
+        b = bench.get(m, {})
+        c = composite.get(m, {})
+        bars = []
+        if "code" in b:
+            bars.append(("代码", b["code"].get("score", 0), C1))
+        if "tool" in b:
+            bars.append(("工具", b["tool"].get("score", 0), C2))
+        if b.get("score") is not None:
+            bars.append(("总分", b["score"], C3))
+        if c.get("composite") is not None:
+            bars.append(("综合", c["composite"], C_WARN))
+        if bars:
+            bench_rows.append((short(m), bars))
+    bench_rows.sort(key=lambda r: -max(v for _, v, _ in r[1]))
+
+    # KPI
+    last_day = days[-1] if days else None
+    last_rate = ""
+    if last_day:
+        tot = sum(1 for r in q_rows if r["day"] == last_day)
+        ok = sum(1 for r in q_rows if r["day"] == last_day and r["ok"])
+        last_rate = f"{ok}/{tot}"
+    best = max((c.get("composite", 0) for c in composite.values()), default=0)
+    degraded = think.get("degraded", 0)
+    probe_bad = sum(1 for v in probe.values() if v.get("fails", 0) >= 2)
+
+    def card(k, v, s="", color=C_TEXT):
+        return (f'<div class="card"><div class="k">{k}</div>'
+                f'<div class="v" style="color:{color}">{v}</div><div class="s">{s}</div></div>')
+
+    cards = "".join([
+        card("Canary 最近一轮", last_rate or "—", last_day or ""),
+        card("覆盖模型", len(models), "canary 历史中出现的模型"),
+        card("最高综合分", f"{best:.3f}" if best else "—", "bench + 可用性加权", C_OK),
+        card("思考降智", degraded, "magpie-think 判定", C_BAD if degraded else C_OK),
+        card("探针失败", probe_bad, "fails ≥ 2 的模型", C_BAD if probe_bad else C_OK),
+        card("历史样本", len(q_rows), f"{len(days)} 天", C_DIM),
+    ])
+
+    # think 对比表
+    think_rows = []
+    for m, v in sorted(think.get("models", {}).items(), key=lambda kv: kv[1].get("ratio", 9)):
+        ratio = v.get("ratio", 0)
+        cls = "bad" if ratio <= 0.25 else ("warn" if ratio <= 0.5 else "ok")
+        think_rows.append(
+            f'<tr class="{cls}"><td>{esc(short(m))}</td>'
+            f'<td class="mono">{v.get("base", 0):.0f}</td>'
+            f'<td class="mono">{v.get("recent", 0):.0f}</td>'
+            f'<td class="mono">{ratio:.2f}</td>'
+            f'<td>{"严重下降" if ratio <= 0.25 else ("下降" if ratio <= 0.5 else "正常")}</td></tr>')
+
+    probe_rows = []
+    for m, v in sorted(probe.items()):
+        fails = v.get("fails", 0)
+        state = "正常" if fails == 0 else ("已移出组" if fails >= 2 else "波动")
+        cls = "ok" if fails == 0 else ("bad" if fails >= 2 else "warn")
+        last = v.get("last_fail") or v.get("last_ok")
+        probe_rows.append(
+            f'<tr class="{cls}"><td>{esc(short(m))}</td><td class="mono">{fails}</td>'
+            f'<td>{state}</td>'
+            f'<td class="mono dim">{esc((v.get("last_err") or "")[:62])}</td>'
+            f'<td class="dim">{datetime.fromtimestamp(last).strftime("%m-%d %H:%M") if last else "—"}</td></tr>'
+        )
+
+    gen = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return f"""<!doctype html><html lang="zh-CN"><head><meta charset="utf-8">
+<title>magpie-watch 检测历史</title>
+<style>
+  :root {{ color-scheme: dark; }}
+  * {{ box-sizing: border-box; }}
+  body {{ margin:0; padding:28px 32px 60px; background:{C_BG}; color:{C_TEXT};
+         font:13px/1.55 -apple-system,"PingFang SC","Noto Sans CJK SC",sans-serif; }}
+  h1 {{ font-size:19px; margin:0 0 4px; font-weight:600; }}
+  .sub {{ color:{C_DIM}; font-size:12px; margin-bottom:22px; }}
+  .cards {{ display:flex; gap:12px; flex-wrap:wrap; margin-bottom:24px; }}
+  .card {{ background:{C_PANEL}; border:1px solid {C_LINE}; border-radius:10px; padding:12px 16px; min-width:140px; }}
+  .card .k {{ color:{C_DIM}; font-size:11px; }}
+  .card .v {{ font-size:22px; font-weight:600; margin:2px 0; }}
+  .card .s {{ color:{C_DIM}; font-size:10px; }}
+  section {{ background:{C_PANEL}; border:1px solid {C_LINE}; border-radius:10px; padding:16px 18px; margin-bottom:18px; }}
+  section h2 {{ font-size:13px; margin:0 0 12px; font-weight:600; }}
+  section h2 span {{ color:{C_DIM}; font-weight:400; font-size:11px; margin-left:8px; }}
+  table {{ width:100%; border-collapse:collapse; font-size:11.5px; }}
+  th {{ text-align:left; color:{C_DIM}; font-weight:500; padding:6px 8px; border-bottom:1px solid {C_LINE}; }}
+  td {{ padding:5px 8px; border-bottom:1px solid #1e222b; }}
+  tr.ok td:nth-child(5), tr.ok td:nth-child(3) {{ color:{C_OK}; }}
+  tr.warn td:nth-child(5), tr.warn td:nth-child(3) {{ color:{C_WARN}; }}
+  tr.bad td:nth-child(5), tr.bad td:nth-child(3) {{ color:{C_BAD}; }}
+  .mono {{ font-family:"JetBrains Mono",ui-monospace,monospace; }}
+  .dim {{ color:{C_DIM}; }}
+  .empty {{ color:{C_DIM}; font-size:12px; }}
+  .legend {{ display:flex; align-items:center; gap:6px; color:{C_DIM}; font-size:10px; margin-top:10px; }}
+  .legend span {{ display:inline-block; width:10px; height:3px; margin-left:10px; }}
+  .legend span:first-child {{ margin-left:0; }}
+  code {{ background:#20242e; padding:1px 5px; border-radius:4px; font-size:11px; }}
+</style></head><body>
+<h1>magpie-watch 检测历史</h1>
+<div class="sub">生成于 {gen} · canary 窗口 {days[0] if days else "—"} → {days[-1] if days else "—"} · 共 {len(q_rows)} 条逐题样本</div>
+<div class="cards">{cards}</div>
+
+<section><h2>Canary 每日通过率 <span>8 道 exact-match 题，按天聚合</span></h2>
+{svg_series(pass_series, ymin=0, ymax=100, unit="%")}
+</section>
+
+<section><h2>题目 × 模型 通过率 <span>全历史累计；灰格=未测</span></h2>
+{svg_heat(matrix)}
+</section>
+
+<section><h2>Bench 分数 <span>代码 / 工具 / 总分 / 综合排序</span></h2>
+{svg_grouped_bars(bench_rows)}
+</section>
+
+<section><h2>响应延迟中位 <span>只取成功样本，ms</span></h2>
+{svg_series(lat_series, unit="ms")}
+</section>
+
+<section><h2>推理 token 中位 <span>降智的先行指标：突然归零或骤降</span></h2>
+{svg_series(tok_series)}
+</section>
+
+<section><h2>思考质量对比 <span>magpie-think：7 天基线 vs 最近 24h</span></h2>
+<table><thead><tr><th>模型</th><th>基线 token 中位</th><th>近期 token 中位</th><th>比值</th><th>判定</th></tr></thead>
+<tbody>{''.join(think_rows) or '<tr><td colspan="5" class="dim">暂无数据</td></tr>'}</tbody></table>
+</section>
+
+<section><h2>探针状态 <span>连续 2 轮失败即移出 free-first</span></h2>
+<table><thead><tr><th>模型</th><th>连续失败</th><th>状态</th><th>最近错误</th><th>时间</th></tr></thead>
+<tbody>{''.join(probe_rows) or '<tr><td colspan="5" class="dim">暂无数据</td></tr>'}</tbody></table>
+</section>
+</body></html>"""
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-o", "--out", default=str(OUT))
+    ap.add_argument("--open", action="store_true")
+    args = ap.parse_args()
+
+    html = build(load_jsonl(CANARY), load_json(BENCH, {}), load_json(COMPOSITE, {}),
+                 load_json(THINK, {}), load_json(PROBE, {}))
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(html, encoding="utf-8")
+    print(f"已生成 {out} ({len(html) / 1024:.0f} KB)")
+    if args.open:
+        subprocess.Popen(["xdg-open", str(out)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
