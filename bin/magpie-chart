@@ -336,6 +336,7 @@ def build(canary: list[dict], bench: dict, composite: dict, think: dict, probe: 
 
 <section><h2>Bench 分数 <span>代码 / 工具 / 总分 / 综合排序</span></h2>
 {svg_grouped_bars(bench_rows)}
+<div class="legend"><span style="background:{C1}"></span>代码<span style="background:{C2}"></span>工具<span style="background:{C3}"></span>总分<span style="background:{C_WARN}"></span>综合</div>
 </section>
 
 <section><h2>响应延迟中位 <span>只取成功样本，ms</span></h2>
